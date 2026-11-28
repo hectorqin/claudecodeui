@@ -7,7 +7,8 @@ import type { ServerEvent,
   LLMProvider,
   LoadingProgress,
   Project,
-  ProjectSession,IsSessionProcessing } from '@/shared/types';
+  ProjectSession,
+  SessionSelectOptions,IsSessionProcessing } from '@/shared/types';
 import {
   removeChildSession,
   renameChildSession,
@@ -1091,7 +1092,7 @@ export function useProjectsState({
   );
 
   const handleSessionSelect = useCallback(
-    (session: ProjectSession) => {
+    (session: ProjectSession, options?: SessionSelectOptions) => {
       clearSessionAttention(session.id);
       setSelectedSession(session);
 
@@ -1107,7 +1108,7 @@ export function useProjectsState({
         const sessionProjectId = session.__projectId;
         const currentProjectId = selectedProject?.projectId;
 
-        if (sessionProjectId !== currentProjectId) {
+        if (options?.closeSidebar || sessionProjectId !== currentProjectId) {
           setSidebarOpen(false);
         }
       }

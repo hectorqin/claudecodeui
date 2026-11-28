@@ -4,7 +4,7 @@ import type { TFunction } from 'i18next';
 
 import { LLMProviderLogo, Tooltip, buttonVariants } from '@/shared/ui';
 import { cn } from '@/shared/utils';
-import type { ProjectSession, SessionWithProvider } from '@/shared/types';
+import type { ProjectSession, SessionSelectOptions, SessionWithProvider } from '@/shared/types';
 import { useCompactSidebar } from '@/modules/sidebar/hooks/useCompactSidebar';
 import { PROVIDER_LABELS, createSessionViewModel, formatCompactAge } from '@/modules/sidebar/utils/sidebarProjectFormatting';
 
@@ -17,8 +17,12 @@ type SidebarChildSessionItemProps = {
   /** The turn ended but work it launched still runs. */
   hasBackgroundWork: boolean;
   currentTime: Date;
-  /** Opens the session; the second argument is the projectId the session belongs to, which may not be the listing project. */
-  onSessionSelect: (session: SessionWithProvider, projectId: string) => void;
+  /**
+   * Opens the session; the second argument is the projectId the session
+   * belongs to, which may not be the listing project. The compact layout asks
+   * for the drawer to close, as a normal row does by selecting its project.
+   */
+  onSessionSelect: (session: SessionWithProvider, projectId: string, options?: SessionSelectOptions) => void;
   t: TFunction;
 };
 
@@ -46,6 +50,10 @@ function SidebarChildSessionItem({
   const age = formatCompactAge(sessionView.sessionTime, currentTime);
   const projectPath = typeof session.projectPath === 'string' ? session.projectPath : '';
   const providerLabel = PROVIDER_LABELS[session.__provider] ?? session.__provider;
+  // The turn ended but work it launched still runs: not done, so not muted,
+  // and marked the way normal session rows mark it.
+  const showBackgroundIndicator = hasBackgroundWork && !isProcessing;
+  const backgroundLabel = t('tooltips.backgroundWorkIndicator', { defaultValue: 'Background work running' });
 
   return (
     <a
@@ -65,7 +73,7 @@ function SidebarChildSessionItem({
       onClick={(event) => {
         if (event.metaKey || event.ctrlKey || event.shiftKey || event.altKey) return;
         event.preventDefault();
-        onSessionSelect(session, session.__projectId ?? '');
+        onSessionSelect(session, session.__projectId ?? '', isCompact ? { closeSidebar: true } : undefined);
       }}
     >
       <div className="flex w-full min-w-0 items-center gap-1.5">
@@ -89,6 +97,12 @@ function SidebarChildSessionItem({
           <Tooltip content={t('tooltips.processingSessionIndicator', 'Processing session')} position="top">
             <span className="flex h-5 w-5 flex-shrink-0 items-center justify-center rounded-md text-muted-foreground" data-child-session-running="">
               <Loader2 className="h-3 w-3 animate-spin" />
+            </span>
+          </Tooltip>
+        ) : showBackgroundIndicator ? (
+          <Tooltip content={backgroundLabel} position="top">
+            <span className="flex h-5 w-5 flex-shrink-0 items-center justify-center" data-child-session-background="">
+              <span role="status" aria-label={backgroundLabel} className="h-2 w-2 animate-pulse rounded-full bg-purple-500 dark:bg-purple-400" />
             </span>
           </Tooltip>
         ) : age ? (

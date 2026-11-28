@@ -108,3 +108,24 @@ test('opening a child selects its own project, even one the sidebar does not lis
   assert.equal(result.current.selectedSession?.__provider, 'codex');
   assert.deepEqual(mocks.sessionDetails.mock.calls, [['coder']]);
 });
+
+test('on mobile, opening a same-project child closes the drawer and keeps the chosen session', async () => {
+  mocks.projects.mockResolvedValue({ ok: true, json: async () => [acme, worktree] });
+  const navigate = vi.fn();
+  const { result } = renderHook(() => useProjectsState({
+    sessionId: undefined, navigate, subscribe, isMobile: true, isSessionProcessing: () => false,
+  }));
+  await waitFor(() => assert.equal(result.current.projects.length, 2));
+  act(() => result.current.handleProjectSelect(result.current.projects[0]));
+  act(() => result.current.setSidebarOpen(true));
+
+  const reviewer: ProjectSession = { id: 'reviewer', summary: 'reviewer', __provider: 'claude', __projectId: 'acme' };
+  act(() => result.current.handleSessionSelect(reviewer));
+  assert.equal(result.current.sidebarOpen, true, 'a plain same-project pick leaves the drawer as it was');
+
+  act(() => result.current.handleSessionSelect(reviewer, { closeSidebar: true }));
+  assert.equal(result.current.sidebarOpen, false);
+  assert.equal(result.current.selectedSession?.id, 'reviewer');
+  assert.equal(result.current.selectedProject?.projectId, 'acme');
+  assert.deepEqual(navigate.mock.calls.at(-1), ['/session/reviewer']);
+});
