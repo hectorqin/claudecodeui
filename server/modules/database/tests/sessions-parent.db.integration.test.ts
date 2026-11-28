@@ -135,3 +135,52 @@ test('child trees nest recursively in creation order, skip archived children and
     assert.deepEqual(looped[0].childSessions[0].childSessions, []);
   });
 });
+
+test('a chain deeper than any fixed limit is walked to its end, so no generation drops out of every list', async () => {
+  await withDatabase(() => {
+    const db = getConnection();
+    sessionsDb.createAppSession('gen-0', 'claude', '/workspace/app', 'Root');
+    const depth = 12;
+    for (let generation = 1; generation <= depth; generation += 1) {
+      // Alternate projects and providers, as orchestrators nesting workers do.
+      sessionsDb.createAppSession(`gen-${generation}`, generation % 2 ? 'codex' : 'claude', `/workspace/wt-${generation}`, `Gen ${generation}`, `gen-${generation - 1}`);
+    }
+    db.prepare("UPDATE sessions SET created_at = '2026-11-01T00:00:00.000Z'").run();
+
+    let node = sessionsDb.getChildSessionsByParentIds(['gen-0']).get('gen-0')?.[0];
+    const reached: string[] = [];
+    while (node) {
+      reached.push(node.id);
+      assert.equal(node.projectPath, `/workspace/wt-${reached.length}`);
+      node = node.childSessions[0];
+    }
+    assert.equal(reached.length, depth, 'every generation is under its parent');
+    // ...and each is out of its own project, so each appears exactly once.
+    for (let generation = 1; generation <= depth; generation += 1) {
+      assert.equal(sessionsDb.countSessionsByProjectPath(`/workspace/wt-${generation}`), 0);
+      assert.equal(sessionsDb.countAttachedChildSessionsByProjectPath(`/workspace/wt-${generation}`), 1);
+    }
+
+    // Archiving a middle generation hands its subtree back to its own projects.
+    sessionsDb.updateSessionIsArchived('gen-6', true);
+    node = sessionsDb.getChildSessionsByParentIds(['gen-0']).get('gen-0')?.[0];
+    let count = 0;
+    while (node) { count += 1; node = node.childSessions[0]; }
+    assert.equal(count, 5);
+    assert.equal(sessionsDb.countSessionsByProjectPath('/workspace/wt-7'), 1);
+    assert.equal(sessionsDb.getChildSessionsByParentIds(['gen-7']).get('gen-7')?.[0].id, 'gen-8');
+  });
+});
+
+test('attached-child counts for many projects come from one grouped query', async () => {
+  await withDatabase(() => {
+    sessionsDb.createAppSession('lead', 'claude', '/workspace/app', 'Lead');
+    sessionsDb.createAppSession('a1', 'codex', '/workspace/a', 'A1', 'lead');
+    sessionsDb.createAppSession('a2', 'codex', '/workspace/a', 'A2', 'lead');
+    sessionsDb.createAppSession('b1', 'codex', '/workspace/b', 'B1', 'lead');
+    sessionsDb.createAppSession('own', 'codex', '/workspace/c', 'Own');
+    const counts = sessionsDb.countAttachedChildSessionsByProjectPaths(['/workspace/a', '/workspace/b', '/workspace/c', '/workspace/app']);
+    assert.deepEqual([...counts.entries()].sort(), [['/workspace/a', 2], ['/workspace/b', 1]]);
+    assert.deepEqual(sessionsDb.countAttachedChildSessionsByProjectPaths([]), new Map());
+  });
+});

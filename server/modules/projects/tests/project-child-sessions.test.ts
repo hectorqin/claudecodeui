@@ -113,3 +113,31 @@ test('pinned summaries say which pins are attached children', async () => {
     assert.deepEqual(pins.map((pin) => [pin.sessionId, pin.parentSessionId]), [[coder, lead], [lead, null]]);
   });
 });
+
+test('child trees and attached counts cost the same number of reads for any number of projects', async (t) => {
+  await withDatabase(async () => {
+    const readsFor = async (projectCount: number) => {
+      for (let index = 0; index < projectCount; index += 1) {
+        const lead = sessionsService.createAppSession('claude', `/workspace/p${projectCount}-${index}`, 'lead').sessionId;
+        sessionsService.createAppSession('codex', `/workspace/p${projectCount}-${index}-wt`, 'worker', { parentSessionId: lead });
+      }
+      const trees = t.mock.method(sessionsDb, 'getChildSessionsByParentIds');
+      const counts = t.mock.method(sessionsDb, 'countAttachedChildSessionsByProjectPaths');
+      const perProjectCount = t.mock.method(sessionsDb, 'countAttachedChildSessionsByProjectPath');
+      const projects = await getProjectsWithSessions({ skipSynchronization: true });
+      const reads = [trees.mock.callCount(), counts.mock.callCount(), perProjectCount.mock.callCount()];
+      t.mock.restoreAll();
+      return { reads, projects };
+    };
+
+    const few = await readsFor(2);
+    const many = await readsFor(8);
+    assert.deepEqual(few.reads, [1, 1, 0]);
+    assert.deepEqual(many.reads, [1, 1, 0]);
+    // The batched result still maps back to each project.
+    const leads = many.projects.filter((project) => project.sessions.length > 0);
+    assert.equal(leads.length, 10);
+    assert.ok(leads.every((project) => project.sessions[0].childSessions.length === 1));
+    assert.ok(many.projects.filter((project) => project.path.endsWith('-wt')).every((project) => project.childSessionCount === 1));
+  });
+});
