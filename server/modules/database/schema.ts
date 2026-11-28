@@ -145,6 +145,12 @@ CREATE TABLE IF NOT EXISTS sessions (
     -- normally. Informational only: a fork is a fully independent provider
     -- session, and deleting the source does not affect it.
     forked_from_session_id TEXT,
+    -- The app session that started this one (e.g. an orchestrator's lead
+    -- session starting a worker through the Agent API), NULL otherwise.
+    -- Separate from fork lineage: a child may live in another project and run
+    -- on another provider. Set once when the row is created; the session
+    -- synchronizer never writes it.
+    parent_session_id TEXT,
     isArchived BOOLEAN DEFAULT 0,
     created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
     updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,

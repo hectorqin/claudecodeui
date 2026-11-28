@@ -55,6 +55,8 @@ type CreateAppSessionResult = {
 type ArchivedSessionListItem = {
   sessionId: string;
   provider: LLMProvider;
+  /** The stored parent session id, whether or not that parent is still active. */
+  parentSessionId: string | null;
   projectId: string | null;
   projectPath: string | null;
   projectDisplayName: string;
@@ -72,6 +74,8 @@ type RecentSessionListItem = Pick<
 
 type PinnedSessionListItem = RecentSessionListItem & {
   forkedFromSessionId: string | null;
+  /** The active session this one is nested under; such pins are not listed in their own project's tree. */
+  parentSessionId: string | null;
   forkAncestors: ReturnType<typeof sessionsDb.getForkAncestors>;
 };
 
@@ -399,6 +403,7 @@ export const sessionsService = {
         lastActivity: normalizedTimestamp,
         forkedFromSessionId: session.forked_from_session_id,
         forkAncestors: session.forked_from_session_id ? sessionsDb.getForkAncestors(session.session_id) : [],
+        parentSessionId: session.parent_session_id ? sessionsDb.getAttachedParentId(session.session_id) : null,
       };
     });
   },
@@ -459,11 +464,15 @@ export const sessionsService = {
    * this row later, when the provider runtime announces it mid-run. Its title
    * comes directly from the first visible CloudCLI message and is limited to
    * four whole words before any provider-owned storage exists.
+   *
+   * `parentSessionId` (canonical app id, validated by the caller) records the
+   * session that started this one, which the sidebar nests it under.
    */
   createAppSession(
     provider: LLMProvider,
     projectPath: string,
     initialMessage: string,
+    options: { parentSessionId?: string | null } = {},
   ): CreateAppSessionResult {
     const normalizedProjectPath = projectPath.trim();
     if (!normalizedProjectPath) {
@@ -475,7 +484,7 @@ export const sessionsService = {
 
     const sessionId = randomUUID();
     const sessionName = buildCloudCliSessionName(initialMessage);
-    sessionsDb.createAppSession(sessionId, provider, normalizedProjectPath, sessionName);
+    sessionsDb.createAppSession(sessionId, provider, normalizedProjectPath, sessionName, options.parentSessionId ?? null);
 
     return {
       sessionId,
@@ -542,6 +551,7 @@ export const sessionsService = {
       providerSessionId: forked.providerSessionId,
       jsonlPath: forked.jsonlPath,
       forkedFromSessionId: sessionId,
+      parentSessionId: source.parent_session_id,
       // A fork that silently dropped to the catalog default would answer
       // differently from the conversation it was branched from.
       model: source.model,
@@ -861,6 +871,7 @@ export const sessionsService = {
       return {
         sessionId: session.session_id,
         provider: session.provider as LLMProvider,
+        parentSessionId: session.parent_session_id ?? null,
         projectId: project?.project_id ?? null,
         projectPath,
         projectDisplayName: resolveProjectDisplayName(projectPath, project?.custom_project_name),

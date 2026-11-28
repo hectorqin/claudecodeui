@@ -4,7 +4,7 @@ import path from 'node:path';
 import { projectsDb, sessionsDb } from '@/modules/database/index.js';
 import { sessionSynchronizerService } from '@/modules/providers/index.js';
 import { WS_OPEN_STATE, connectedClients } from '@/modules/websocket/index.js';
-import type { RealtimeClientConnection, SessionForkAncestor } from '@/shared/types.js';
+import type { ChildSessionSummary, RealtimeClientConnection, SessionForkAncestor } from '@/shared/types.js';
 import { AppError } from '@/shared/utils.js';
 
 type SessionSummary = {
@@ -15,6 +15,15 @@ type SessionSummary = {
   lastActivity: string;
   forkedFromSessionId: string | null;
   forkAncestors: SessionForkAncestor[];
+  /**
+   * The active session this one is nested under (see
+   * `sessionsDb.getAttachedParentId`). Always null on an active project's
+   * session page, which leaves such children out and lists them in their
+   * parent's `childSessions` instead.
+   */
+  parentSessionId: string | null;
+  /** Active sessions this one started, possibly in other projects and providers. */
+  childSessions: ChildSessionSummary[];
 };
 
 type SessionRepositoryRow = {
@@ -24,6 +33,7 @@ type SessionRepositoryRow = {
   updated_at?: string | null;
   created_at?: string | null;
   forked_from_session_id?: string | null;
+  parent_session_id?: string | null;
 };
 
 export type ProjectListItem = {
@@ -37,6 +47,12 @@ export type ProjectListItem = {
     hasMore: boolean;
     total: number;
   };
+  /**
+   * Active sessions of this project that are listed under a parent session
+   * instead of here. The sidebar hides a project that has these and no
+   * sessions of its own.
+   */
+  childSessionCount: number;
 };
 
 export type ArchivedProjectListItem = ProjectListItem & {
@@ -120,8 +136,9 @@ function normalizeSessionPagination(options: SessionPaginationOptions = {}): { l
   };
 }
 
-function mapSessionRowToSummary(row: SessionRepositoryRow): SessionSummary {
-  return {
+function mapSessionRowsToSummaries(rows: SessionRepositoryRow[]): SessionSummary[] {
+  const childSessions = sessionsDb.getChildSessionsByParentIds(rows.map((row) => row.session_id));
+  return rows.map((row) => ({
     id: row.session_id,
     provider: row.provider,
     summary: row.custom_name || '',
@@ -129,14 +146,16 @@ function mapSessionRowToSummary(row: SessionRepositoryRow): SessionSummary {
     lastActivity: row.updated_at ?? row.created_at ?? new Date().toISOString(),
     forkedFromSessionId: row.forked_from_session_id ?? null,
     forkAncestors: row.forked_from_session_id ? sessionsDb.getForkAncestors(row.session_id) : [],
-  };
+    parentSessionId: row.parent_session_id ? sessionsDb.getAttachedParentId(row.session_id) : null,
+    childSessions: childSessions.get(row.session_id) ?? [],
+  }));
 }
 
 function readProjectSessionsIncludingArchived(projectPath: string): ProjectSessionsPageResult {
   const rows = sessionsDb.getSessionsByProjectPathIncludingArchived(projectPath) as SessionRepositoryRow[];
 
   return {
-    sessions: rows.map(mapSessionRowToSummary),
+    sessions: mapSessionRowsToSummaries(rows),
     total: rows.length,
     hasMore: false,
   };
@@ -158,7 +177,7 @@ function readProjectSessionsPageByPath(
   const total = sessionsDb.countSessionsByProjectPath(projectPath);
 
   return {
-    sessions: rows.map(mapSessionRowToSummary),
+    sessions: mapSessionRowsToSummaries(rows),
     total,
     hasMore: pagination.offset + rows.length < total,
   };
@@ -233,6 +252,7 @@ export async function getProjectsWithSessions(
         hasMore: sessionsPage.hasMore,
         total: sessionsPage.total,
       },
+      childSessionCount: sessionsDb.countAttachedChildSessionsByProjectPath(projectPath),
     });
   }
 
@@ -286,6 +306,8 @@ export async function getArchivedProjectsWithSessions(
         hasMore: sessionsPage.hasMore,
         total: sessionsPage.total,
       },
+      // An archived project lists every session it holds, children included.
+      childSessionCount: 0,
     });
   }
 

@@ -417,6 +417,14 @@ export type SessionUpsertedEvent = {
     forkedFromSessionId?: string | null;
     /** Active ancestors outside the current page, for the Projects tree only. */
     forkAncestors?: SessionForkAncestor[];
+    /**
+     * App id of the active session this one is nested under in the sidebar
+     * (it started this one); null when there is none or that session is
+     * archived or deleted. See `sessionsDb.getAttachedParentId`.
+     */
+    parentSessionId?: string | null;
+    /** Active sessions this one started, nested under it in the sidebar. */
+    childSessions?: ChildSessionSummary[];
   };
   project: SessionUpsertedProject | null;
   timestamp: string;
@@ -436,6 +444,27 @@ export type SessionForkAncestor = {
   forkedFromSessionId: string | null;
 };
 
+/**
+ * One active session started by another session (`sessions.parent_session_id`),
+ * as the sidebar renders it under its parent. Children may belong to another
+ * project and another provider than the parent, so each carries its own
+ * provider and project. Built only by the database module; archived children,
+ * and children in archived projects, are left out.
+ */
+export type ChildSessionSummary = {
+  id: string;
+  provider: LLMProvider;
+  summary: string;
+  lastActivity: string;
+  createdAt: string;
+  projectId: string | null;
+  projectPath: string | null;
+  parentSessionId: string;
+  /** Fork source, so forks of a child nest under it among its siblings. */
+  forkedFromSessionId: string | null;
+  childSessions: ChildSessionSummary[];
+};
+
 //----------------- SESSION PINS ------------
 
 /**
@@ -449,6 +478,8 @@ export type SessionPinRecord = {
   session_id: string;
   /** Canonical app parent id, used with bounded active ancestry in pin summaries. */
   forked_from_session_id: string | null;
+  /** Stored parent; the pin summary resolves whether it is still attached. */
+  parent_session_id: string | null;
   provider: LLMProvider;
   project_id: string | null;
   project_path: string | null;

@@ -1,7 +1,7 @@
 import { getConnection } from '@/modules/database/connection.js';
 import { projectsDb } from '@/modules/database/repositories/projects.db.js';
 import { normalizeProjectPath } from '@/shared/index.js';
-import type { ClearedContextSegment, SessionForkAncestor } from '@/shared/index.js';
+import type { ChildSessionSummary, ClearedContextSegment, SessionForkAncestor } from '@/shared/index.js';
 
 type SessionRow = {
   session_id: string;
@@ -18,6 +18,8 @@ type SessionRow = {
   permission_mode: string | null;
   /** The app session this one was branched from; NULL unless it is a fork. */
   forked_from_session_id: string | null;
+  /** The app session that started this one; NULL unless it is a child session. */
+  parent_session_id: string | null;
   isArchived: number;
   created_at: string;
   updated_at: string;
@@ -41,7 +43,40 @@ function preservePinsOnReplacement(sourceId: string, targetId: string, replace: 
 }
 
 const SESSION_ROW_COLUMNS =
-  'session_id, provider, provider_session_id, project_path, jsonl_path, custom_name, model, effort, permission_mode, forked_from_session_id, isArchived, created_at, updated_at';
+  'session_id, provider, provider_session_id, project_path, jsonl_path, custom_name, model, effort, permission_mode, forked_from_session_id, parent_session_id, isArchived, created_at, updated_at';
+
+/**
+ * True for a row (aliased `alias`) that is nested under its parent in the
+ * sidebar: it names a parent, and that parent is an active session in an
+ * active project. Such rows are listed only under their parent, never in their
+ * own project's session page. A child whose parent is archived or deleted is
+ * not attached and lists in its own project again.
+ */
+const attachedChildSql = (alias: string) => `(
+  ${alias}.parent_session_id IS NOT NULL AND EXISTS (
+    SELECT 1 FROM sessions AS attached_parent
+    LEFT JOIN projects AS attached_parent_project ON attached_parent_project.project_path = attached_parent.project_path
+    WHERE attached_parent.session_id = ${alias}.parent_session_id
+      AND attached_parent.session_id <> ${alias}.session_id
+      AND attached_parent.isArchived = 0
+      AND COALESCE(attached_parent_project.isArchived, 0) = 0
+  )
+)`;
+
+/** Children nest at most this deep; deeper rows are cut off rather than walked forever on damaged data. */
+const MAX_CHILD_SESSION_DEPTH = 8;
+
+type ChildSessionRow = {
+  session_id: string;
+  provider: string;
+  custom_name: string | null;
+  project_path: string | null;
+  project_id: string | null;
+  parent_session_id: string;
+  forked_from_session_id: string | null;
+  created_at: string;
+  updated_at: string;
+};
 
 const SQLITE_UTC_TIMESTAMP_REGEX = /^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$/;
 
@@ -195,6 +230,7 @@ export const sessionsDb = {
     provider: string,
     projectPath: string,
     customName?: string,
+    parentSessionId?: string | null,
   ): string {
     const db = getConnection();
     const normalizedProjectPath = normalizeProjectPathForProvider(provider, projectPath);
@@ -202,9 +238,9 @@ export const sessionsDb = {
     projectsDb.createProjectPath(normalizedProjectPath);
 
     db.prepare(
-      `INSERT INTO sessions (session_id, provider, provider_session_id, custom_name, project_path, jsonl_path, isArchived, created_at, updated_at)
-       VALUES (?, ?, NULL, ?, ?, NULL, 0, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)`
-    ).run(sessionId, provider, customName ?? null, normalizedProjectPath);
+      `INSERT INTO sessions (session_id, provider, provider_session_id, custom_name, project_path, jsonl_path, parent_session_id, isArchived, created_at, updated_at)
+       VALUES (?, ?, NULL, ?, ?, NULL, ?, 0, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)`
+    ).run(sessionId, provider, customName ?? null, normalizedProjectPath, parentSessionId ?? null);
 
     return sessionId;
   },
@@ -216,6 +252,9 @@ export const sessionsDb = {
    * `jsonl_path` immediately, because a fork's transcript file exists before
    * the row does — and the filesystem watcher would otherwise index it as an
    * unrelated session under its own id.
+   *
+   * A fork of a child session keeps the child's parent, so it is listed among
+   * that parent's children and nests under its source there.
    */
   createForkedSession(input: {
     sessionId: string;
@@ -225,6 +264,7 @@ export const sessionsDb = {
     providerSessionId: string;
     jsonlPath: string;
     forkedFromSessionId: string;
+    parentSessionId?: string | null;
     model: string | null;
     effort: string | null;
     permissionMode?: string | null;
@@ -241,8 +281,8 @@ export const sessionsDb = {
       db.prepare('DELETE FROM sessions WHERE session_id = ? AND session_id <> ?')
         .run(input.providerSessionId, input.sessionId);
       db.prepare(
-        `INSERT INTO sessions (session_id, provider, provider_session_id, custom_name, project_path, jsonl_path, model, effort, permission_mode, forked_from_session_id, isArchived, created_at, updated_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)`
+        `INSERT INTO sessions (session_id, provider, provider_session_id, custom_name, project_path, jsonl_path, model, effort, permission_mode, forked_from_session_id, parent_session_id, isArchived, created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)`
       ).run(
         input.sessionId,
         input.provider,
@@ -254,6 +294,7 @@ export const sessionsDb = {
         input.effort,
         input.permissionMode ?? null,
         input.forkedFromSessionId,
+        input.parentSessionId ?? null,
       );
     }))();
 
@@ -624,6 +665,99 @@ export const sessionsDb = {
   },
 
   /**
+   * The parent a session is nested under in the sidebar: its stored
+   * `parent_session_id` while that parent is an active session in an active
+   * project, otherwise null (see `attachedChildSql`).
+   */
+  getAttachedParentId(sessionId: string): string | null {
+    const row = getConnection().prepare(
+      `SELECT sessions.parent_session_id AS parent_session_id FROM sessions
+       WHERE sessions.session_id = ? AND ${attachedChildSql('sessions')}`
+    ).get(sessionId) as { parent_session_id: string } | undefined;
+    return row?.parent_session_id ?? null;
+  },
+
+  /**
+   * The active children of each given session, recursively, keyed by parent
+   * id; parents without children are absent from the map. Children are
+   * ordered by creation (the order their parent started them) and may live in
+   * any project and run on any provider. Archived children and children in
+   * archived projects are left out. One query per nesting level, so a page of
+   * parents costs the same as one.
+   */
+  getChildSessionsByParentIds(parentSessionIds: readonly string[]): Map<string, ChildSessionSummary[]> {
+    const db = getConnection();
+    const result = new Map<string, ChildSessionSummary[]>();
+    const roots = [...new Set(parentSessionIds)];
+    // Which requested parent each placed child descends from. A requested
+    // parent can itself be another one's child; it is only skipped below
+    // its own descendants, where damaged data would form a loop.
+    const rootOf = new Map(roots.map((id) => [id, id]));
+    const placed = new Set<string>();
+    const childrenOf = new Map<string, ChildSessionSummary[]>();
+    let frontier = roots;
+
+    for (let depth = 0; depth < MAX_CHILD_SESSION_DEPTH && frontier.length > 0; depth += 1) {
+      const rows: ChildSessionRow[] = [];
+      // Stay well below SQLite's bound-parameter limit on very large pages.
+      for (let start = 0; start < frontier.length; start += 500) {
+        const batch = frontier.slice(start, start + 500);
+        rows.push(...db.prepare(
+          `SELECT sessions.session_id, sessions.provider, sessions.custom_name, sessions.project_path,
+                  projects.project_id, sessions.parent_session_id, sessions.forked_from_session_id,
+                  sessions.created_at, sessions.updated_at
+           FROM sessions
+           LEFT JOIN projects ON projects.project_path = sessions.project_path
+           WHERE sessions.parent_session_id IN (${batch.map(() => '?').join(', ')})
+             AND sessions.session_id <> sessions.parent_session_id
+             AND sessions.isArchived = 0
+             AND COALESCE(projects.isArchived, 0) = 0
+           ORDER BY julianday(sessions.created_at) ASC, sessions.session_id ASC`
+        ).all(...batch) as ChildSessionRow[]);
+      }
+
+      const next: string[] = [];
+      for (const row of rows) {
+        // A cycle in damaged data, or a row already placed under another parent.
+        const root = rootOf.get(row.parent_session_id);
+        if (placed.has(row.session_id) || !root || row.session_id === root) continue;
+        placed.add(row.session_id);
+        if (!rootOf.has(row.session_id)) rootOf.set(row.session_id, root);
+        const createdAt = normalizeTimestamp(row.created_at) ?? row.created_at;
+        const child: ChildSessionSummary = {
+          id: row.session_id,
+          provider: row.provider as ChildSessionSummary['provider'],
+          summary: row.custom_name || '',
+          lastActivity: normalizeTimestamp(row.updated_at) ?? createdAt,
+          createdAt,
+          projectId: row.project_id ?? null,
+          projectPath: row.project_path ?? null,
+          parentSessionId: row.parent_session_id,
+          forkedFromSessionId: row.forked_from_session_id ?? null,
+          childSessions: [],
+        };
+        const siblings = childrenOf.get(row.parent_session_id) ?? [];
+        siblings.push(child);
+        childrenOf.set(row.parent_session_id, siblings);
+        next.push(row.session_id);
+      }
+      frontier = next;
+    }
+
+    // Wire each level onto its parent now that every level is read.
+    for (const children of childrenOf.values()) {
+      for (const child of children) {
+        child.childSessions = childrenOf.get(child.id) ?? [];
+      }
+    }
+    for (const parentId of new Set(parentSessionIds)) {
+      const children = childrenOf.get(parentId);
+      if (children?.length) result.set(parentId, children);
+    }
+    return result;
+  },
+
+  /**
    * Resolves one session row through the provider-native id.
    *
    * The filesystem watcher only knows provider ids (they come from transcript
@@ -795,6 +929,7 @@ export const sessionsDb = {
          FROM sessions
          WHERE project_path = ?
            AND isArchived = 0
+           AND NOT ${attachedChildSql('sessions')}
          ORDER BY datetime(COALESCE(updated_at, created_at)) DESC, session_id DESC
          LIMIT ? OFFSET ?`
       )
@@ -803,6 +938,10 @@ export const sessionsDb = {
     return normalizeSessionRows(rows);
   },
 
+  /**
+   * Counts the sessions a project's paginated session list holds: active
+   * ones, less the child sessions that are listed under their parent instead.
+   */
   countSessionsByProjectPath(projectPath: string): number {
     const db = getConnection();
     const normalizedProjectPath = normalizeProjectPath(projectPath);
@@ -811,9 +950,30 @@ export const sessionsDb = {
         `SELECT COUNT(*) AS count
          FROM sessions
          WHERE project_path = ?
-           AND isArchived = 0`
+           AND isArchived = 0
+           AND NOT ${attachedChildSql('sessions')}`
       )
       .get(normalizedProjectPath) as { count: number } | undefined;
+
+    return Number(row?.count ?? 0);
+  },
+
+  /**
+   * Counts a project's active sessions that are listed under a parent session
+   * rather than in the project's own list. The sidebar hides a project whose
+   * only sessions are such children.
+   */
+  countAttachedChildSessionsByProjectPath(projectPath: string): number {
+    const db = getConnection();
+    const row = db
+      .prepare(
+        `SELECT COUNT(*) AS count
+         FROM sessions
+         WHERE project_path = ?
+           AND isArchived = 0
+           AND ${attachedChildSql('sessions')}`
+      )
+      .get(normalizeProjectPath(projectPath)) as { count: number } | undefined;
 
     return Number(row?.count ?? 0);
   },

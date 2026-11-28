@@ -4,7 +4,7 @@ import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
 
-import { closeConnection, initializeDatabase, sessionsDb } from '@/modules/database/index.js';
+import { closeConnection, getConnection, initializeDatabase, sessionsDb } from '@/modules/database/index.js';
 import { providerRegistry } from '@/modules/providers/provider.registry.js';
 import { sessionsService } from '@/modules/providers/services/sessions.service.js';
 import type { IProviderFork } from '@/shared/interfaces.js';
@@ -169,5 +169,18 @@ test('forking a session that does not exist is a 404', async () => {
       () => sessionsService.forkSessionById('no-such-session'),
       (error: Error & { code?: string }) => error.code === 'SESSION_NOT_FOUND',
     );
+  });
+});
+
+test('a fork of a child session keeps the child parent, so it stays in that family', async () => {
+  await withForkableClaude(async ({ directory }) => {
+    sessionsDb.createAppSession('lead', 'codex', '/workspace/lead', 'Lead');
+    seedSource(directory);
+    getConnection().prepare("UPDATE sessions SET parent_session_id = 'lead' WHERE session_id = ?").run(SOURCE_ID);
+
+    const result = await sessionsService.forkSessionById(SOURCE_ID);
+    const fork = sessionsDb.getSessionById(result.sessionId);
+    assert.equal(fork?.forked_from_session_id, SOURCE_ID);
+    assert.equal(fork?.parent_session_id, 'lead');
   });
 });

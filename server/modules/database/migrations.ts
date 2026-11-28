@@ -443,6 +443,18 @@ const addForkedFromSessionIdColumn = (db: Database): void => {
 };
 
 /**
+ * Adds the `parent_session_id` column recording which session started this
+ * one, for the sidebar's child-session nesting.
+ *
+ * Nothing is backfilled: no session predating the column was started with a
+ * parent.
+ */
+const addParentSessionIdColumn = (db: Database): void => {
+  const columnNames = getTableInfo(db, 'sessions').map((column) => column.name);
+  addColumnToTableIfNotExists(db, 'sessions', columnNames, 'parent_session_id', 'TEXT');
+};
+
+/**
  * Adds the `model` column that records which model each session runs with.
  *
  * Left NULL for pre-existing rows on purpose: the model resolver falls back to
@@ -560,6 +572,7 @@ export const runMigrations = (db: Database) => {
     addSessionEffortColumn(db);
     addSessionPermissionModeColumn(db);
     addForkedFromSessionIdColumn(db);
+    addParentSessionIdColumn(db);
     // Create after legacy session-table repairs so the foreign key names the canonical app id.
     db.exec(SESSION_PINS_TABLE_SCHEMA_SQL);
     ensureProjectsForSessionPaths(db);
@@ -569,6 +582,7 @@ export const runMigrations = (db: Database) => {
     db.exec('CREATE INDEX IF NOT EXISTS idx_sessions_provider_session_id ON sessions(provider_session_id)');
     db.exec('CREATE INDEX IF NOT EXISTS idx_sessions_project_path ON sessions(project_path)');
     db.exec('CREATE INDEX IF NOT EXISTS idx_sessions_forked_from ON sessions(forked_from_session_id)');
+    db.exec('CREATE INDEX IF NOT EXISTS idx_sessions_parent_session_id ON sessions(parent_session_id)');
     // The due-message poll runs on a timer; without this it table-scans.
     db.exec('CREATE INDEX IF NOT EXISTS idx_scheduled_messages_due ON scheduled_messages(status, scheduled_for)');
     db.exec('CREATE INDEX IF NOT EXISTS idx_scheduled_messages_session ON scheduled_messages(session_id)');

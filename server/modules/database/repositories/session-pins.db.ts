@@ -7,6 +7,7 @@ export const sessionPinsDb = {
   list(userId: number): SessionPinRecord[] {
     return getConnection().prepare(`
       SELECT sessions.session_id, sessions.provider, sessions.project_path, sessions.forked_from_session_id,
+             sessions.parent_session_id,
              projects.project_id, projects.custom_project_name, sessions.custom_name,
              COALESCE(sessions.updated_at, sessions.created_at) AS last_activity
       FROM session_pins

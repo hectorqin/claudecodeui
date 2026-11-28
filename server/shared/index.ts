@@ -12,6 +12,6 @@ export { AppError, asyncHandler, createApiSuccessResponse, SIDE_QUESTION_ID_PATT
 export type { BackgroundTaskSummary, ClearedContextSegment, FetchHistoryOptions, FetchHistoryResult, NormalizedMessage, WorkflowAgentActivity } from './types.js';
 export { sliceTailPage } from './utils.js';
 
-// Session persistence uses canonical path normalization and fork/history metadata.
+// Session persistence uses canonical path normalization and fork/child/history metadata.
 export { normalizeProjectPath } from './utils.js';
-export type { SessionForkAncestor } from './types.js';
+export type { ChildSessionSummary, SessionForkAncestor } from './types.js';

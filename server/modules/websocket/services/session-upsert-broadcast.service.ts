@@ -51,6 +51,10 @@ async function buildSessionUpsertedEvent(
       lastActivity: row.updated_at ?? row.created_at ?? new Date().toISOString(),
       forkedFromSessionId: row.forked_from_session_id ?? null,
       forkAncestors: row.forked_from_session_id ? sessionsDb.getForkAncestors(row.session_id) : [],
+      // A child is placed under this parent by the client and kept out of its
+      // own project's list; `project` still names the project it runs in.
+      parentSessionId: row.parent_session_id ? sessionsDb.getAttachedParentId(row.session_id) : null,
+      childSessions: sessionsDb.getChildSessionsByParentIds([row.session_id]).get(row.session_id) ?? [],
     },
     project: project
       ? {

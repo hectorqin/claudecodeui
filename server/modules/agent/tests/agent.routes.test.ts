@@ -444,6 +444,7 @@ test('Agent route reads no model catalog for a continued session of an unregiste
         provider: 'gemini',
         provider_session_id: null,
         project_path: '/home/test/project',
+        parent_session_id: null,
       }),
       getSessionByProviderSessionId: () => null,
       createAppSession: () => { throw new Error('a continued session must not create a row'); },
@@ -544,4 +545,107 @@ test('Agent route enforces an explicitly requested Claude mode and leaves the im
   const implicit = await startClaudeRunWith({});
   assert.equal(implicit.permissionMode, 'bypassPermissions');
   assert.equal(implicit.enforcePermissionMode, false);
+});
+
+test('Agent capabilities advertise child sessions', async () => {
+  await withAgentServer(createDependencies(), async (baseUrl) => {
+    const body = await (await fetch(`${baseUrl}/api/agent/capabilities`)).json() as { childSessions?: boolean };
+    assert.equal(body.childSessions, true);
+  });
+});
+
+/** A session table stand-in for the parentSessionId tests: rows by app id, also reachable by provider id. */
+function childSessionDependencies(rows: Array<{ session_id: string; provider_session_id: string | null; provider: string; project_path: string; parent_session_id: string | null }>) {
+  const created: Array<{ provider: string; projectPath: string; parentSessionId: string | null | undefined }> = [];
+  const runs: string[] = [];
+  const dependencies = createDependencies({
+    fileSystem: { access: async () => undefined } as unknown as AgentDependencies['fileSystem'],
+    models: {
+      getProviderModels: async (provider: string) => ({ OPTIONS: [], DEFAULT: `${provider}-default` }),
+    } as unknown as AgentDependencies['models'],
+    sessions: {
+      getSessionById: (id: string) => rows.find((row) => row.session_id === id) ?? null,
+      getSessionByProviderSessionId: (id: string) => rows.find((row) => row.provider_session_id === id) ?? null,
+      createAppSession: (provider: string, projectPath: string, _message: string, options?: { parentSessionId?: string | null }) => {
+        created.push({ provider, projectPath, parentSessionId: options?.parentSessionId });
+        return { sessionId: 'new-child' };
+      },
+    },
+    queryCodex: (async () => { runs.push('codex'); }) as unknown as AgentDependencies['queryCodex'],
+    queryClaude: (async () => { runs.push('claude'); }) as unknown as AgentDependencies['queryClaude'],
+  });
+  return { dependencies, created, runs };
+}
+
+const LEAD_ROW = { session_id: 'lead-app', provider_session_id: 'lead-native', provider: 'claude', project_path: '/home/test/app', parent_session_id: null };
+const CHILD_ROW = { session_id: 'child-app', provider_session_id: 'child-native', provider: 'codex', project_path: '/home/test/app-worktree', parent_session_id: 'lead-app' };
+
+async function postAgent(baseUrl: string, body: Record<string, unknown>) {
+  const response = await fetch(`${baseUrl}/api/agent`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ message: 'Run', stream: false, ...body }),
+  });
+  return { status: response.status, body: await response.json() as { error?: string } };
+}
+
+test('Agent route stores the resolved app id of parentSessionId on a new session in another project and provider', async () => {
+  const { dependencies, created, runs } = childSessionDependencies([LEAD_ROW]);
+  await withAgentServer(dependencies, async (baseUrl) => {
+    // Named by its provider-native id; stored by its app id.
+    const result = await postAgent(baseUrl, { projectPath: '/home/test/app-worktree', provider: 'codex', parentSessionId: 'lead-native' });
+    assert.equal(result.status, 200);
+  });
+  assert.deepEqual(created, [{ provider: 'codex', projectPath: '/home/test/app-worktree', parentSessionId: 'lead-app' }]);
+  assert.deepEqual(runs, ['codex']);
+});
+
+test('Agent route creates a session without a parent when parentSessionId is omitted or blank', async () => {
+  const { dependencies, created } = childSessionDependencies([LEAD_ROW]);
+  await withAgentServer(dependencies, async (baseUrl) => {
+    assert.equal((await postAgent(baseUrl, { projectPath: '/home/test/app' })).status, 200);
+    assert.equal((await postAgent(baseUrl, { projectPath: '/home/test/app', parentSessionId: '  ' })).status, 200);
+  });
+  assert.deepEqual(created.map((entry) => entry.parentSessionId ?? null), [null, null]);
+});
+
+test('Agent route rejects an unknown or non-string parentSessionId before creating anything', async () => {
+  const { dependencies, created, runs } = childSessionDependencies([LEAD_ROW]);
+  await withAgentServer(dependencies, async (baseUrl) => {
+    const unknown = await postAgent(baseUrl, { projectPath: '/home/test/app', parentSessionId: 'nope' });
+    assert.equal(unknown.status, 400);
+    assert.match(unknown.body.error ?? '', /parentSessionId "nope" was not found/);
+    const wrongType = await postAgent(baseUrl, { projectPath: '/home/test/app', parentSessionId: 42 });
+    assert.equal(wrongType.status, 400);
+    assert.equal(wrongType.body.error, 'parentSessionId must be a string');
+  });
+  assert.deepEqual(created, []);
+  assert.deepEqual(runs, []);
+});
+
+test('Agent route continues a child with its own parent, and refuses a different parent or itself', async () => {
+  const OTHER_ROW = { ...LEAD_ROW, session_id: 'other-app', provider_session_id: 'other-native' };
+  const { dependencies, created, runs } = childSessionDependencies([LEAD_ROW, CHILD_ROW, OTHER_ROW]);
+  await withAgentServer(dependencies, async (baseUrl) => {
+    const omitted = await postAgent(baseUrl, { projectPath: '/home/test/app-worktree', sessionId: 'child-app' });
+    assert.equal(omitted.status, 200);
+    // The same parent, by either id, is accepted.
+    const same = await postAgent(baseUrl, { projectPath: '/home/test/app-worktree', sessionId: 'child-app', parentSessionId: 'lead-native' });
+    assert.equal(same.status, 200);
+
+    const different = await postAgent(baseUrl, { projectPath: '/home/test/app-worktree', sessionId: 'child-app', parentSessionId: 'other-app' });
+    assert.equal(different.status, 400);
+    assert.match(different.body.error ?? '', /parentSessionId cannot change/);
+
+    const itself = await postAgent(baseUrl, { projectPath: '/home/test/app-worktree', sessionId: 'child-native', parentSessionId: 'child-app' });
+    assert.equal(itself.status, 400);
+    assert.equal(itself.body.error, 'A session cannot be its own parent');
+
+    // A session created without a parent cannot gain one later.
+    const late = await postAgent(baseUrl, { projectPath: '/home/test/app', sessionId: 'other-app', parentSessionId: 'lead-app' });
+    assert.equal(late.status, 400);
+    assert.match(late.body.error ?? '', /no parent; parentSessionId cannot change/);
+  });
+  assert.deepEqual(created, [], 'a continuation never creates a row');
+  assert.deepEqual(runs, ['codex', 'codex']);
 });
