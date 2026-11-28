@@ -1,4 +1,4 @@
-import type { SessionWithProvider } from '@/shared/types';
+import type { ChildSessionSummary, SessionWithProvider } from '@/shared/types';
 
 type TreeNode = {
   session: SessionWithProvider;
@@ -6,7 +6,39 @@ type TreeNode = {
   children: TreeNode[];
   rank: number;
   pinRank: number;
+  isChildSession: boolean;
 };
+
+export type ProjectSessionTreeRow = {
+  session: SessionWithProvider;
+  parentId: string | null;
+  depth: number;
+  hasChildren: boolean;
+  isLastSibling: boolean;
+  /**
+   * The row is a child session: started by the row it hangs under, and
+   * possibly in another project and on another provider. Rendered read-only,
+   * opened by navigating to it.
+   */
+  isChildSession: boolean;
+};
+
+/** A server child summary as a sidebar session, tagged with its own project so opening it resolves the right workspace. */
+export function childSessionToSession(child: ChildSessionSummary): SessionWithProvider {
+  return {
+    id: child.id,
+    summary: child.summary,
+    lastActivity: child.lastActivity,
+    createdAt: child.createdAt,
+    provider: child.provider,
+    __provider: child.provider,
+    __projectId: child.projectId ?? undefined,
+    projectPath: child.projectPath,
+    parentSessionId: child.parentSessionId,
+    forkedFromSessionId: child.forkedFromSessionId ?? null,
+    childSessions: child.childSessions ?? [],
+  };
+}
 
 /**
  * SidebarProjectSessions alone uses this projection. Keep the shared session
@@ -15,13 +47,60 @@ type TreeNode = {
  * position, and parents always precede children. Ancestor hints fill page gaps,
  * while actual page rows take precedence over their older context snapshots.
  * A pin lifts its entire family; only root ordering changes, never ancestry.
+ *
+ * Child sessions (`childSessions`, started by a row) are emitted under that
+ * row after its forks, in the order they were started. Precedence when a
+ * session has both kinds of parent: a session with an attached child-parent
+ * (`parentSessionId`) is shown only under that parent, so it is dropped from
+ * the input here; fork nesting still applies within each sibling group, which
+ * is how a fork of a child (it inherits the child's parent) nests under its
+ * source among that parent's children.
  */
-export function buildProjectSessionTree(sessions: SessionWithProvider[], projectId: string, pinnedIds: readonly string[] = []) {
+export function buildProjectSessionTree(
+  sessions: SessionWithProvider[],
+  projectId: string,
+  pinnedIds: readonly string[] = [],
+): ProjectSessionTreeRow[] {
+  const roots = buildForkForest(sessions.filter((session) => !session.parentSessionId), projectId, pinnedIds);
+
+  const rows: ProjectSessionTreeRow[] = [];
+  // Each session is emitted once, even when damaged data repeats it.
+  const emitted = new Set<string>();
+  type Frame = { node: TreeNode; depth: number; isLastSibling: boolean; parentId: string | null };
+  const childrenOf = (node: TreeNode): TreeNode[] => {
+    const childSessions = (node.session.childSessions ?? [])
+      .map(childSessionToSession)
+      .filter((child) => !emitted.has(child.id));
+    const childForest = childSessions.length
+      ? buildForkForest(childSessions, projectId, [], true)
+      : [];
+    return [...node.children, ...childForest];
+  };
+  const stack: Frame[] = roots.map((node, index) => ({ node, depth: 0, isLastSibling: index === roots.length - 1, parentId: null })).reverse();
+  while (stack.length) {
+    const { node, depth, isLastSibling, parentId } = stack.pop()!;
+    if (emitted.has(node.session.id)) continue;
+    emitted.add(node.session.id);
+    const children = childrenOf(node);
+    rows.push({ session: node.session, parentId, depth, hasChildren: children.length > 0, isLastSibling, isChildSession: node.isChildSession });
+    for (let index = children.length - 1; index >= 0; index -= 1) {
+      stack.push({ node: children[index], depth: depth + 1, isLastSibling: index === children.length - 1, parentId: node.session.id });
+    }
+  }
+  return rows;
+}
+
+function buildForkForest(
+  sessions: SessionWithProvider[],
+  projectId: string,
+  pinnedIds: readonly string[],
+  isChildSession = false,
+): TreeNode[] {
   const pinRanks = new Map(pinnedIds.map((id, rank) => [id, rank]));
   const nodes = new Map<string, TreeNode>();
   sessions.forEach((session, rank) => {
     if (!nodes.has(session.id)) {
-      nodes.set(session.id, { session, parentId: null, children: [], rank, pinRank: pinRanks.get(session.id) ?? Infinity });
+      nodes.set(session.id, { session, parentId: null, children: [], rank, pinRank: pinRanks.get(session.id) ?? Infinity, isChildSession });
     }
   });
 
@@ -50,7 +129,7 @@ export function buildProjectSessionTree(sessions: SessionWithProvider[], project
         __projectId: projectId,
       } : null;
       if (!parent || parent.__provider !== session.__provider) break;
-      nodes.set(parentId, { session: parent, parentId: null, children: [], rank: Infinity, pinRank: pinRanks.get(parentId) ?? Infinity });
+      nodes.set(parentId, { session: parent, parentId: null, children: [], rank: Infinity, pinRank: pinRanks.get(parentId) ?? Infinity, isChildSession });
       child = parent;
     }
   }
@@ -107,14 +186,5 @@ export function buildProjectSessionTree(sessions: SessionWithProvider[], project
     return a.rank - b.rank;
   });
 
-  const rows: { session: SessionWithProvider; parentId: string | null; depth: number; hasChildren: boolean; isLastSibling: boolean }[] = [];
-  const stack = roots.map((node, index) => ({ node, depth: 0, isLastSibling: index === roots.length - 1 })).reverse();
-  while (stack.length) {
-    const { node, depth, isLastSibling } = stack.pop()!;
-    rows.push({ session: node.session, parentId: node.parentId, depth, hasChildren: node.children.length > 0, isLastSibling });
-    for (let index = node.children.length - 1; index >= 0; index -= 1) {
-      stack.push({ node: node.children[index], depth: depth + 1, isLastSibling: index === node.children.length - 1 });
-    }
-  }
-  return rows;
+  return roots;
 }

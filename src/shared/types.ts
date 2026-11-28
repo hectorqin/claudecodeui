@@ -100,12 +100,38 @@ export type ProjectSession = {
   forkedFromSessionId?: string | null;
   /** Ancestor context for Projects only; excluded from pagination and the Conversations feed. */
   forkAncestors?: ProjectSession[];
+  /**
+   * App id of the active session this one is nested under (the session that
+   * started it). Such a session is listed only under that parent, never in its
+   * own project's list; null/absent otherwise.
+   */
+  parentSessionId?: string | null;
+  /** Active sessions this one started, possibly in other projects and on other providers. */
+  childSessions?: ChildSessionSummary[];
   provider?: LLMProvider;
   __provider?: LLMProvider;
   // Tags the session with the owning project's DB `projectId` so UI handlers
   // (session switching, sidebar focus, etc.) can match against selectedProject.
   __projectId?: string;
   [key: string]: unknown;
+};
+
+/**
+ * One session started by another, as the server nests it under its parent.
+ * Carries its own provider and project because children often run in another
+ * project (a git worktree) and on another provider than their parent.
+ */
+export type ChildSessionSummary = {
+  id: string;
+  provider: LLMProvider;
+  summary: string;
+  lastActivity: string;
+  createdAt?: string;
+  projectId: string | null;
+  projectPath: string | null;
+  parentSessionId: string;
+  forkedFromSessionId?: string | null;
+  childSessions?: ChildSessionSummary[];
 };
 
 /** Pagination metadata returned alongside a project's session page. */
@@ -136,6 +162,11 @@ export type Project = {
   isStarred?: boolean;
   sessions?: ProjectSession[];
   sessionMeta?: ProjectSessionMeta;
+  /**
+   * Active sessions of this project listed under a parent session instead of
+   * here. A project with these and no sessions of its own is not listed.
+   */
+  childSessionCount?: number;
   taskmaster?: ProjectTaskmasterInfo;
   [key: string]: unknown;
 };
@@ -1753,6 +1784,8 @@ export type SessionWithProvider = ProjectSession & {
 export type ArchivedSessionListItem = {
   sessionId: string;
   provider: LLMProvider;
+  /** Stored parent session id, if this session was started by another. */
+  parentSessionId?: string | null;
   projectId: string | null;
   projectPath: string | null;
   projectDisplayName: string;
@@ -1770,7 +1803,7 @@ export type RecentConversationListItem = Pick<
 >;
 
 /** Pin summaries include canonical ancestry so Projects can attach forks outside the loaded page. */
-export type PinnedConversationListItem = RecentConversationListItem & Pick<ProjectSession, 'forkedFromSessionId' | 'forkAncestors'>;
+export type PinnedConversationListItem = RecentConversationListItem & Pick<ProjectSession, 'forkedFromSessionId' | 'forkAncestors' | 'parentSessionId'>;
 
 /**
  * The rename the sidebar currently has open, if any.

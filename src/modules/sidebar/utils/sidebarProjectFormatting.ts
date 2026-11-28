@@ -147,6 +147,35 @@ export const sortProjects = (
   return byName;
 };
 
+/**
+ * True for a project whose visible sessions are all children of sessions
+ * elsewhere (e.g. a git worktree an orchestrator ran its workers in). Those
+ * children are listed under their parent session, so the project itself is
+ * not listed. A project with no sessions at all is still listed.
+ */
+export const isChildOnlyProject = (project: Project): boolean =>
+  Number(project.childSessionCount ?? 0) > 0
+  && (project.sessions?.length ?? 0) === 0
+  && !project.sessionMeta?.hasMore
+  && Number(project.sessionMeta?.total ?? 0) === 0;
+
+/** Whether a session, or any session it started (recursively), is in `activeIds`. */
+export const hasActiveSessionInFamily = (
+  session: Pick<ProjectSession, 'id' | 'childSessions'>,
+  activeIds: ReadonlySet<string>,
+): boolean => {
+  const pending = [session];
+  const seen = new Set<string>();
+  while (pending.length) {
+    const current = pending.pop()!;
+    if (seen.has(String(current.id))) continue;
+    seen.add(String(current.id));
+    if (activeIds.has(String(current.id))) return true;
+    pending.push(...(current.childSessions ?? []));
+  }
+  return false;
+};
+
 export const filterProjects = (projects: Project[], searchFilter: string): Project[] => {
   const normalizedSearch = searchFilter.trim().toLowerCase();
   if (!normalizedSearch) {

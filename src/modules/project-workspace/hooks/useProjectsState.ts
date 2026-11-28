@@ -8,6 +8,11 @@ import type { ServerEvent,
   LoadingProgress,
   Project,
   ProjectSession,IsSessionProcessing } from '@/shared/types';
+import {
+  removeChildSession,
+  renameChildSession,
+  upsertChildSessionInProjects,
+} from '@/modules/project-workspace/utils/childSessions';
 import { mergeProjectSelectionMetadata } from '@/modules/project-workspace/utils/projectSelectionMetadata';
 import { readSelectedProvider } from '@/shared/selectedProvider';
 
@@ -326,6 +331,19 @@ const projectFromRegistration = (project: Project): Project => ({
 });
 
 const removeSessionFromProject = (project: Project, sessionIdToDelete: string): Project => {
+  // A child session is listed under its parent, not counted in the project's
+  // own total, so pruning it from a child list leaves the totals alone.
+  let childrenPruned = false;
+  const sessions = (project.sessions ?? []).map((session) => {
+    const pruned = removeChildSession(session, sessionIdToDelete);
+    if (pruned !== session) childrenPruned = true;
+    return pruned;
+  });
+  const prunedProject = childrenPruned ? { ...project, sessions } : project;
+  return removeOwnSessionFromProject(prunedProject, sessionIdToDelete);
+};
+
+const removeOwnSessionFromProject = (project: Project, sessionIdToDelete: string): Project => {
   const sessions = project.sessions ?? [];
   let changed = false;
   const nextSessions = sessions.filter((session) => {
@@ -371,6 +389,7 @@ const renameSessionInProject = (project: Project, sessionIdToRename: string, sum
         ancestor.id === sessionIdToRename ? { ...ancestor, summary } : ancestor
       )) };
     }
+    next = renameChildSession(next, sessionIdToRename, summary);
     if (next !== session) changed = true;
     return next;
   });
@@ -811,7 +830,11 @@ export function useProjectsState({
         markSessionAttention(upsert.sessionId);
       }
 
-      setProjects((previousProjects) => {
+      // A child session goes under its parent, wherever that is loaded, and
+      // never into its own project's list (which it would otherwise create).
+      if (upsert.session.parentSessionId) {
+        setProjects((previousProjects) => upsertChildSessionInProjects(previousProjects, upsert));
+      } else setProjects((previousProjects) => {
         const targetProjectId = upsert.project?.projectId;
         const existingProject = previousProjects.find((project) =>
           targetProjectId ? project.projectId === targetProjectId : getProjectSessions(project).some((session) => session.id === upsert.sessionId),
@@ -931,7 +954,13 @@ export function useProjectsState({
       }
     }
 
-    if (selectedSession?.id === sessionId) {
+    // A session picked from the sidebar is already selected. It still needs
+    // its project resolved when it belongs to another one than the selected
+    // project — a child session listed under a parent in another project.
+    if (
+      selectedSession?.id === sessionId
+      && (!selectedSession.__projectId || selectedSession.__projectId === selectedProject?.projectId)
+    ) {
       return;
     }
 
@@ -1035,7 +1064,7 @@ export function useProjectsState({
           : resolvedSession,
       );
     })();
-  }, [navigate, sessionId, projects, selectedProject, selectedSession?.id, selectedSession?.__provider]);
+  }, [navigate, sessionId, projects, selectedProject, selectedSession?.id, selectedSession?.__provider, selectedSession?.__projectId]);
 
   const handleProjectSelect = useCallback(
     (project: Project) => {
