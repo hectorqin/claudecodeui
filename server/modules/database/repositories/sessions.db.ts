@@ -63,8 +63,16 @@ const attachedChildSql = (alias: string) => `(
   )
 )`;
 
-/** Children nest at most this deep; deeper rows are cut off rather than walked forever on damaged data. */
-const MAX_CHILD_SESSION_DEPTH = 8;
+/**
+ * The child rows a parent's tree may hold: active sessions in active projects
+ * (aliased `alias`, project joined as `${alias}_project`). The same rule as
+ * `attachedChildSql` applied from the parent's side, so a session is either
+ * reachable from its parent's tree or listed in its own project, never neither.
+ */
+const visibleChildSql = (alias: string) => `
+  ${alias}.session_id <> ${alias}.parent_session_id
+  AND ${alias}.isArchived = 0
+  AND COALESCE(${alias}_project.isArchived, 0) = 0`;
 
 type ChildSessionRow = {
   session_id: string;
@@ -678,81 +686,87 @@ export const sessionsDb = {
   },
 
   /**
-   * The active children of each given session, recursively, keyed by parent
-   * id; parents without children are absent from the map. Children are
-   * ordered by creation (the order their parent started them) and may live in
-   * any project and run on any provider. Archived children and children in
-   * archived projects are left out. One query per nesting level, so a page of
-   * parents costs the same as one.
+   * The active children of each given session, recursively and to any depth,
+   * keyed by parent id; parents without children are absent from the map.
+   * Children are ordered by creation (the order their parent started them)
+   * and may live in any project and run on any provider. Archived children
+   * and children in archived projects are left out, together with their
+   * subtrees, which `attachedChildSql` lists in their own projects instead.
+   *
+   * One recursive query for any number of parents. `UNION` stops it on a
+   * parent loop in damaged data, and each session is placed under one parent
+   * only, so the returned tree is always finite.
    */
   getChildSessionsByParentIds(parentSessionIds: readonly string[]): Map<string, ChildSessionSummary[]> {
-    const db = getConnection();
     const result = new Map<string, ChildSessionSummary[]>();
     const roots = [...new Set(parentSessionIds)];
-    // Which requested parent each placed child descends from. A requested
-    // parent can itself be another one's child; it is only skipped below
-    // its own descendants, where damaged data would form a loop.
-    const rootOf = new Map(roots.map((id) => [id, id]));
+    if (roots.length === 0) return result;
+
+    const rows = getConnection().prepare(
+      `WITH RECURSIVE descendants(session_id) AS (
+         SELECT child.session_id
+         FROM sessions AS child
+         LEFT JOIN projects AS child_project ON child_project.project_path = child.project_path
+         WHERE child.parent_session_id IN (SELECT value FROM json_each(?))
+           AND ${visibleChildSql('child')}
+         UNION
+         SELECT child.session_id
+         FROM sessions AS child
+         JOIN descendants ON child.parent_session_id = descendants.session_id
+         LEFT JOIN projects AS child_project ON child_project.project_path = child.project_path
+         WHERE ${visibleChildSql('child')}
+       )
+       SELECT sessions.session_id, sessions.provider, sessions.custom_name, sessions.project_path,
+              projects.project_id, sessions.parent_session_id, sessions.forked_from_session_id,
+              sessions.created_at, sessions.updated_at
+       FROM descendants
+       JOIN sessions ON sessions.session_id = descendants.session_id
+       LEFT JOIN projects ON projects.project_path = sessions.project_path
+       ORDER BY julianday(sessions.created_at) ASC, sessions.session_id ASC`
+    ).all(JSON.stringify(roots)) as ChildSessionRow[];
+
+    const rowsByParent = new Map<string, ChildSessionRow[]>();
+    for (const row of rows) {
+      const siblings = rowsByParent.get(row.parent_session_id) ?? [];
+      siblings.push(row);
+      rowsByParent.set(row.parent_session_id, siblings);
+    }
+
+    // Each requested parent's own child list. A requested parent that is also
+    // another one's descendant shares this list rather than being walked twice.
+    const rootLists = new Map(roots.map((id) => [id, [] as ChildSessionSummary[]]));
     const placed = new Set<string>();
-    const childrenOf = new Map<string, ChildSessionSummary[]>();
-    let frontier = roots;
-
-    for (let depth = 0; depth < MAX_CHILD_SESSION_DEPTH && frontier.length > 0; depth += 1) {
-      const rows: ChildSessionRow[] = [];
-      // Stay well below SQLite's bound-parameter limit on very large pages.
-      for (let start = 0; start < frontier.length; start += 500) {
-        const batch = frontier.slice(start, start + 500);
-        rows.push(...db.prepare(
-          `SELECT sessions.session_id, sessions.provider, sessions.custom_name, sessions.project_path,
-                  projects.project_id, sessions.parent_session_id, sessions.forked_from_session_id,
-                  sessions.created_at, sessions.updated_at
-           FROM sessions
-           LEFT JOIN projects ON projects.project_path = sessions.project_path
-           WHERE sessions.parent_session_id IN (${batch.map(() => '?').join(', ')})
-             AND sessions.session_id <> sessions.parent_session_id
-             AND sessions.isArchived = 0
-             AND COALESCE(projects.isArchived, 0) = 0
-           ORDER BY julianday(sessions.created_at) ASC, sessions.session_id ASC`
-        ).all(...batch) as ChildSessionRow[]);
-      }
-
-      const next: string[] = [];
-      for (const row of rows) {
-        // A cycle in damaged data, or a row already placed under another parent.
-        const root = rootOf.get(row.parent_session_id);
-        if (placed.has(row.session_id) || !root || row.session_id === root) continue;
-        placed.add(row.session_id);
-        if (!rootOf.has(row.session_id)) rootOf.set(row.session_id, root);
-        const createdAt = normalizeTimestamp(row.created_at) ?? row.created_at;
-        const child: ChildSessionSummary = {
-          id: row.session_id,
-          provider: row.provider as ChildSessionSummary['provider'],
-          summary: row.custom_name || '',
-          lastActivity: normalizeTimestamp(row.updated_at) ?? createdAt,
-          createdAt,
-          projectId: row.project_id ?? null,
-          projectPath: row.project_path ?? null,
-          parentSessionId: row.parent_session_id,
-          forkedFromSessionId: row.forked_from_session_id ?? null,
-          childSessions: [],
-        };
-        const siblings = childrenOf.get(row.parent_session_id) ?? [];
-        siblings.push(child);
-        childrenOf.set(row.parent_session_id, siblings);
-        next.push(row.session_id);
-      }
-      frontier = next;
-    }
-
-    // Wire each level onto its parent now that every level is read.
-    for (const children of childrenOf.values()) {
-      for (const child of children) {
-        child.childSessions = childrenOf.get(child.id) ?? [];
+    for (const root of roots) {
+      const stack: Array<{ parentId: string; into: ChildSessionSummary[] }> = [{ parentId: root, into: rootLists.get(root)! }];
+      while (stack.length) {
+        const { parentId, into } = stack.pop()!;
+        for (const row of rowsByParent.get(parentId) ?? []) {
+          // Placed once only; a loop back to the root being walked is cut.
+          if (placed.has(row.session_id) || row.session_id === root) continue;
+          placed.add(row.session_id);
+          const createdAt = normalizeTimestamp(row.created_at) ?? row.created_at;
+          const ownList = rootLists.get(row.session_id);
+          const child: ChildSessionSummary = {
+            id: row.session_id,
+            provider: row.provider as ChildSessionSummary['provider'],
+            summary: row.custom_name || '',
+            lastActivity: normalizeTimestamp(row.updated_at) ?? createdAt,
+            createdAt,
+            projectId: row.project_id ?? null,
+            projectPath: row.project_path ?? null,
+            parentSessionId: row.parent_session_id,
+            forkedFromSessionId: row.forked_from_session_id ?? null,
+            childSessions: ownList ?? [],
+          };
+          into.push(child);
+          // A requested parent fills its shared list when its own turn comes.
+          if (!ownList) stack.push({ parentId: row.session_id, into: child.childSessions });
+        }
       }
     }
-    for (const parentId of new Set(parentSessionIds)) {
-      const children = childrenOf.get(parentId);
-      if (children?.length) result.set(parentId, children);
+
+    for (const [root, children] of rootLists) {
+      if (children.length) result.set(root, children);
     }
     return result;
   },
@@ -959,23 +973,31 @@ export const sessionsDb = {
   },
 
   /**
-   * Counts a project's active sessions that are listed under a parent session
-   * rather than in the project's own list. The sidebar hides a project whose
-   * only sessions are such children.
+   * Counts, per project path, the active sessions listed under a parent
+   * session rather than in the project's own list, in one grouped query for
+   * the whole project list. Paths without any are absent. The sidebar hides a
+   * project whose only sessions are such children.
    */
-  countAttachedChildSessionsByProjectPath(projectPath: string): number {
-    const db = getConnection();
-    const row = db
+  countAttachedChildSessionsByProjectPaths(projectPaths: readonly string[]): Map<string, number> {
+    const counts = new Map<string, number>();
+    if (projectPaths.length === 0) return counts;
+    const rows = getConnection()
       .prepare(
-        `SELECT COUNT(*) AS count
+        `SELECT project_path, COUNT(*) AS count
          FROM sessions
-         WHERE project_path = ?
+         WHERE project_path IN (SELECT value FROM json_each(?))
            AND isArchived = 0
-           AND ${attachedChildSql('sessions')}`
+           AND ${attachedChildSql('sessions')}
+         GROUP BY project_path`
       )
-      .get(normalizeProjectPath(projectPath)) as { count: number } | undefined;
+      .all(JSON.stringify([...new Set(projectPaths.map((projectPath) => normalizeProjectPath(projectPath)))])) as Array<{ project_path: string; count: number }>;
+    for (const row of rows) counts.set(row.project_path, Number(row.count));
+    return counts;
+  },
 
-    return Number(row?.count ?? 0);
+  /** One project's count of `countAttachedChildSessionsByProjectPaths`. */
+  countAttachedChildSessionsByProjectPath(projectPath: string): number {
+    return sessionsDb.countAttachedChildSessionsByProjectPaths([projectPath]).get(normalizeProjectPath(projectPath)) ?? 0;
   },
 
   deleteSessionsByProjectPath(projectPath: string): void {

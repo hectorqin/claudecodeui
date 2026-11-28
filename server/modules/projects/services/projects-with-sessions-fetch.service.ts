@@ -139,8 +139,21 @@ function normalizeSessionPagination(options: SessionPaginationOptions = {}): { l
   };
 }
 
-function mapSessionRowsToSummaries(rows: SessionRepositoryRow[]): SessionSummary[] {
-  const childSessions = sessionsDb.getChildSessionsByParentIds(rows.map((row) => row.session_id));
+type ProjectSessionRowsPage = {
+  rows: SessionRepositoryRow[];
+  total: number;
+  hasMore: boolean;
+};
+
+/**
+ * Maps page rows to summaries. `childSessions` is the child-tree map for
+ * these rows, passed in when the caller already read it for a whole project
+ * list; otherwise this reads it for these rows.
+ */
+function mapSessionRowsToSummaries(
+  rows: SessionRepositoryRow[],
+  childSessions: Map<string, ChildSessionSummary[]> = sessionsDb.getChildSessionsByParentIds(rows.map((row) => row.session_id)),
+): SessionSummary[] {
   return rows.map((row) => ({
     id: row.session_id,
     provider: row.provider,
@@ -154,23 +167,27 @@ function mapSessionRowsToSummaries(rows: SessionRepositoryRow[]): SessionSummary
   }));
 }
 
-function readProjectSessionsIncludingArchived(projectPath: string): ProjectSessionsPageResult {
+function readProjectSessionRowsIncludingArchived(projectPath: string): ProjectSessionRowsPage {
   const rows = sessionsDb.getSessionsByProjectPathIncludingArchived(projectPath) as SessionRepositoryRow[];
+  return { rows, total: rows.length, hasMore: false };
+}
 
-  return {
-    sessions: mapSessionRowsToSummaries(rows),
-    total: rows.length,
-    hasMore: false,
-  };
+/**
+ * Turns every project's page rows into summaries with one child-tree read
+ * for the whole list, so its cost does not grow with the number of projects.
+ */
+function mapProjectPagesToSummaries(pages: ProjectSessionRowsPage[]): SessionSummary[][] {
+  const childSessions = sessionsDb.getChildSessionsByParentIds(pages.flatMap((page) => page.rows.map((row) => row.session_id)));
+  return pages.map((page) => mapSessionRowsToSummaries(page.rows, childSessions));
 }
 
 /**
  * Reads one paginated project session slice from the DB and groups rows by provider.
  */
-function readProjectSessionsPageByPath(
+function readProjectSessionRowsPageByPath(
   projectPath: string,
   options: SessionPaginationOptions = {},
-): ProjectSessionsPageResult {
+): ProjectSessionRowsPage {
   const pagination = normalizeSessionPagination(options);
   const rows = sessionsDb.getSessionsByProjectPathPage(
     projectPath,
@@ -180,10 +197,18 @@ function readProjectSessionsPageByPath(
   const total = sessionsDb.countSessionsByProjectPath(projectPath);
 
   return {
-    sessions: mapSessionRowsToSummaries(rows),
+    rows,
     total,
     hasMore: pagination.offset + rows.length < total,
   };
+}
+
+function readProjectSessionsPageByPath(
+  projectPath: string,
+  options: SessionPaginationOptions = {},
+): ProjectSessionsPageResult {
+  const page = readProjectSessionRowsPageByPath(projectPath, options);
+  return { sessions: mapSessionRowsToSummaries(page.rows), total: page.total, hasMore: page.hasMore };
 }
 
 // Broadcast progress to all connected WebSocket clients.
@@ -219,7 +244,8 @@ export async function getProjectsWithSessions(
   }>;
   const totalProjects = projectRows.length;
   const knownProjectPaths = new Set(projectRows.map((row) => row.project_path));
-  const projects: ProjectListItem[] = [];
+  const projects: Array<Omit<ProjectListItem, 'sessions' | 'childSessionCount'>> = [];
+  const pages: ProjectSessionRowsPage[] = [];
   let processedProjects = 0;
 
   for (const row of projectRows) {
@@ -240,10 +266,11 @@ export async function getProjectsWithSessions(
         ? row.custom_project_name
         : await generateDisplayName(path.basename(projectPath) || projectPath, projectPath);
 
-    const sessionsPage = readProjectSessionsPageByPath(projectPath, {
+    const sessionsPage = readProjectSessionRowsPageByPath(projectPath, {
       limit: options.sessionsLimit,
       offset: options.sessionsOffset,
     });
+    pages.push(sessionsPage);
 
     projects.push({
       projectId,
@@ -252,14 +279,16 @@ export async function getProjectsWithSessions(
       fullPath: projectPath,
       isStarred: Boolean(row.isStarred),
       worktreeOf: resolveWorktreeParent(projectPath, knownProjectPaths),
-      sessions: sessionsPage.sessions,
       sessionMeta: {
         hasMore: sessionsPage.hasMore,
         total: sessionsPage.total,
       },
-      childSessionCount: sessionsDb.countAttachedChildSessionsByProjectPath(projectPath),
     });
   }
+
+  // Child trees and attached-child counts for every project at once.
+  const sessionsByProject = mapProjectPagesToSummaries(pages);
+  const childSessionCounts = sessionsDb.countAttachedChildSessionsByProjectPaths(projects.map((project) => project.path));
 
   broadcastProgress({
     phase: 'complete',
@@ -267,7 +296,11 @@ export async function getProjectsWithSessions(
     total: totalProjects,
   });
 
-  return projects;
+  return projects.map((project, index) => ({
+    ...project,
+    sessions: sessionsByProject[index],
+    childSessionCount: childSessionCounts.get(project.path) ?? 0,
+  }));
 }
 
 /**
@@ -289,7 +322,8 @@ export async function getArchivedProjectsWithSessions(
     isStarred?: number;
   }>;
 
-  const archivedProjects: ArchivedProjectListItem[] = [];
+  const archivedProjects: Array<Omit<ArchivedProjectListItem, 'sessions'>> = [];
+  const pages: ProjectSessionRowsPage[] = [];
 
   for (const row of projectRows) {
     const displayName =
@@ -297,7 +331,8 @@ export async function getArchivedProjectsWithSessions(
         ? row.custom_project_name
         : await generateDisplayName(path.basename(row.project_path) || row.project_path, row.project_path);
 
-    const sessionsPage = readProjectSessionsIncludingArchived(row.project_path);
+    const sessionsPage = readProjectSessionRowsIncludingArchived(row.project_path);
+    pages.push(sessionsPage);
 
     archivedProjects.push({
       projectId: row.project_id,
@@ -307,7 +342,6 @@ export async function getArchivedProjectsWithSessions(
       isStarred: Boolean(row.isStarred),
       worktreeOf: null,
       isArchived: true,
-      sessions: sessionsPage.sessions,
       sessionMeta: {
         hasMore: sessionsPage.hasMore,
         total: sessionsPage.total,
@@ -317,7 +351,8 @@ export async function getArchivedProjectsWithSessions(
     });
   }
 
-  return archivedProjects;
+  const sessionsByProject = mapProjectPagesToSummaries(pages);
+  return archivedProjects.map((project, index) => ({ ...project, sessions: sessionsByProject[index] }));
 }
 
 /**
