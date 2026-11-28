@@ -1741,7 +1741,7 @@ export type SidebarProjectListProps = SessionRowActions & {
   onCancelEditingProject: () => void;
   onSaveProjectName: (projectId: string, nextName: string) => void;
   onDeleteProject: (project: Project) => void;
-  onSessionSelect: (session: SessionWithProvider, projectName: string) => void;
+  onSessionSelect: (session: SessionWithProvider, projectName: string, options?: SessionSelectOptions) => void;
   onNewSession: (project: Project) => void;
   /** The project whose session list is in bulk-selection mode and the rows ticked in it, or null while no list is selecting. */
   sessionSelection: SidebarSessionSelection | null;
@@ -1776,6 +1776,16 @@ export type SidebarSearchMode = 'projects' | 'conversations' | 'running' | 'arch
 export type ArchivedProjectListItem = Project & { isArchived: true };
 
 /** A ProjectSession whose LLM provider has been resolved into the required __provider field, so list rendering never has to re-derive it. */
+/**
+ * How a sidebar pick should open a session. `closeSidebar` closes the mobile
+ * drawer even when the session belongs to the project already selected —
+ * normal rows get that from selecting their project first, which a child row
+ * (listed under a parent, often in another project) must not do.
+ */
+export type SessionSelectOptions = {
+  closeSidebar?: boolean;
+};
+
 export type SessionWithProvider = ProjectSession & {
   __provider: LLMProvider;
 };

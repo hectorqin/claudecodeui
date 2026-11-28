@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 
-import { fireEvent, render, screen } from '@testing-library/react';
+import { fireEvent, render, screen, within } from '@testing-library/react';
 import type { ComponentProps } from 'react';
 import type { TFunction } from 'i18next';
 import { test, vi } from 'vitest';
@@ -107,4 +107,30 @@ test('the selected child is highlighted and revealed under a collapsed parent', 
   const link = container.querySelector('[data-child-session-id="reviewer"]')!;
   assert.equal(link.getAttribute('aria-current'), 'page');
   assert.doesNotMatch(link.className, /opacity-60/);
+});
+
+test.each([false, true])('opening a child asks the mobile drawer to close only in compact=%s', (isCompact) => {
+  compact.value = isCompact;
+  const select = vi.fn();
+  render(<SidebarProjectSessions {...props({ onSessionSelect: select })} />);
+  // `reviewer` runs in the listing project itself: the drawer would otherwise stay open.
+  fireEvent.click(screen.getByText('reviewer-c38d53'));
+  const [opened, projectId, options] = select.mock.calls[0];
+  assert.equal(opened.id, 'reviewer');
+  assert.equal(projectId, 'acme');
+  assert.deepEqual(options, isCompact ? { closeSidebar: true } : undefined);
+});
+
+test('a child whose turn ended but whose background work still runs shows the background indicator, not an age', () => {
+  compact.value = false;
+  const { container } = render(<SidebarProjectSessions {...props({
+    activeSessions: new Set(['reviewer']), backgroundSessionIds: new Set(['reviewer']),
+  })} />);
+  const link = container.querySelector('[data-child-session-id="reviewer"]')!;
+  assert.equal(link.getAttribute('data-child-session-state'), 'running');
+  assert.doesNotMatch(link.className, /opacity-60/);
+  assert.equal(link.querySelector('[data-child-session-running]'), null, 'no spinner: no turn is in flight');
+  assert.ok(link.querySelector('[data-child-session-background]'));
+  assert.equal(within(link as HTMLElement).getByRole('status').getAttribute('aria-label'), 'tooltips.backgroundWorkIndicator');
+  assert.ok(!link.textContent?.includes('20m'), 'the age is replaced by the indicator');
 });
