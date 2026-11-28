@@ -8,6 +8,8 @@ import type { ArchivedProjectListItem, ArchivedSessionListItem, ConversationProj
 import {
   filterProjects,
   getAllSessions,
+  hasActiveSessionInFamily,
+  isChildOnlyProject,
   sortProjects,
 } from '@/modules/sidebar/utils/sidebarProjectFormatting';
 import {
@@ -777,8 +779,9 @@ export function useSidebarController({
     });
   }, [optimisticStarByProjectId, projects]);
 
+  // A project holding only child sessions (listed under their parents) is not listed itself.
   const sortedProjects = useMemo(
-    () => sortProjects(projectsWithResolvedStarState, projectSortOrder),
+    () => sortProjects(projectsWithResolvedStarState.filter((project) => !isChildOnlyProject(project)), projectSortOrder),
     [projectSortOrder, projectsWithResolvedStarState],
   );
 
@@ -788,7 +791,8 @@ export function useSidebarController({
     }
 
     return sortedProjects.reduce<Project[]>((acc, project) => {
-      const sessions = (project.sessions ?? []).filter((session) => activeSessionIds.has(String(session.id)));
+      // A session stays listed while a child session it started is running.
+      const sessions = (project.sessions ?? []).filter((session) => hasActiveSessionInFamily(session, activeSessionIds));
       const runningCount = sessions.length;
 
       if (runningCount === 0) {

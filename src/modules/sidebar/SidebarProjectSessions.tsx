@@ -5,6 +5,7 @@ import type { TFunction } from 'i18next';
 import { Button } from '@/shared/ui';
 import { cn } from '@/shared/utils';
 import type { LLMProvider, Project, ProjectSession, SessionWithProvider, SidebarSessionSelection } from '@/shared/types';
+import SidebarChildSessionItem from '@/modules/sidebar/SidebarChildSessionItem';
 import SidebarSessionItem from '@/modules/sidebar/SidebarSessionItem';
 import { useCompactSidebar } from '@/modules/sidebar/hooks/useCompactSidebar';
 import { useSessionPins } from '@/modules/sidebar/hooks/useSessionPins';
@@ -109,7 +110,8 @@ export default function SidebarProjectSessions({
     const ancestors = new Map(sessions.flatMap((session) => session.forkAncestors ?? []).map((ancestor) => [ancestor.id, ancestor]));
     // Include pins beyond the loaded page without changing page offsets or
     // replacing loaded rows' fork metadata with the smaller pin summaries.
-    const offPagePins: SessionWithProvider[] = projectPins.filter((pin) => includeOffPagePins && !loadedIds.has(pin.sessionId)).map((pin) => ({
+    // A pinned child session is listed under its parent, not here.
+    const offPagePins: SessionWithProvider[] = projectPins.filter((pin) => includeOffPagePins && !pin.parentSessionId && !loadedIds.has(pin.sessionId)).map((pin) => ({
       forkedFromSessionId: pin.forkedFromSessionId,
       forkAncestors: pin.forkAncestors,
       ...ancestors.get(pin.sessionId),
@@ -180,7 +182,11 @@ export default function SidebarProjectSessions({
   // row's options menu applies — so it is not selectable either.
   const isSessionRunning = (session: SessionWithProvider) =>
     activeSessions.has(session.id) && !backgroundSessionIds.has(session.id);
-  const selectableSessionIds = treeRows.filter(({ session }) => !isSessionRunning(session)).map(({ session }) => session.id);
+  // Child rows belong to other sessions' families (often other projects) and
+  // are only opened from here, so bulk selection leaves them alone.
+  const selectableSessionIds = treeRows
+    .filter(({ session, isChildSession }) => !isChildSession && !isSessionRunning(session))
+    .map(({ session }) => session.id);
   // Re-derived from the selectable rows rather than read straight off the
   // selection, so a row that started running after it was ticked drops out of
   // the count, the button and the ids the confirmation is opened with.
@@ -296,11 +302,12 @@ export default function SidebarProjectSessions({
       ) : (
         <>
           <div className={cn(!hasForks && 'space-y-1')} data-testid="project-session-tree">
-            {visibleRows.map(({ session, parentId, depth, hasChildren, isLastSibling, continuationDepths }) => (
+            {visibleRows.map(({ session, parentId, depth, hasChildren, isLastSibling, isChildSession, continuationDepths }) => (
               <div
                 key={session.id}
                 data-session-id={session.id}
                 data-parent-session-id={parentId ?? undefined}
+                data-child-session={isChildSession || undefined}
                 data-fork-depth={depth}
                 data-fork-branch={hasChildren || undefined}
                 className="relative flex min-w-0 items-stretch"
@@ -355,31 +362,43 @@ export default function SidebarProjectSessions({
                   ) : <span className="w-3 flex-shrink-0" aria-hidden="true" />
                 )}
                 <div className="min-w-0 flex-1">
-                  <SidebarSessionItem
-                    project={project}
-                    session={session}
-                    selectedSession={selectedSession}
-                    isProcessing={isSessionRunning(session)}
-                    hasBackgroundWork={backgroundSessionIds.has(session.id)}
-                    needsAttention={attentionSessionIds.has(session.id)}
-                    currentTime={currentTime}
-                    onRenameDraftChange={onRenameDraftChange}
-                    isEditing={session.id === sessionRenameId}
-                    renameDraft={session.id === sessionRenameId ? sessionRenameDraft : ''}
-                    onStartEditingSession={onStartEditingSession}
-                    onCancelEditingSession={onCancelEditingSession}
-                    onSaveEditingSession={onSaveEditingSession}
-                    onProjectSelect={onProjectSelect}
-                    onSessionSelect={onSessionSelect}
-                    onArchiveSession={onArchiveSession}
-                    onDeleteSession={onDeleteSession}
-                    onForkSession={onForkSession}
-                    isSelecting={isSelecting}
-                    isChecked={checkedSessionIds.has(session.id)}
-                    onToggleSessionSelected={onToggleSessionSelected}
-                    treeRow={hasForks}
-                    t={t}
-                  />
+                  {isChildSession ? (
+                    <SidebarChildSessionItem
+                      session={session}
+                      selectedSession={selectedSession}
+                      isProcessing={isSessionRunning(session)}
+                      hasBackgroundWork={backgroundSessionIds.has(session.id)}
+                      currentTime={currentTime}
+                      onSessionSelect={onSessionSelect}
+                      t={t}
+                    />
+                  ) : (
+                    <SidebarSessionItem
+                      project={project}
+                      session={session}
+                      selectedSession={selectedSession}
+                      isProcessing={isSessionRunning(session)}
+                      hasBackgroundWork={backgroundSessionIds.has(session.id)}
+                      needsAttention={attentionSessionIds.has(session.id)}
+                      currentTime={currentTime}
+                      onRenameDraftChange={onRenameDraftChange}
+                      isEditing={session.id === sessionRenameId}
+                      renameDraft={session.id === sessionRenameId ? sessionRenameDraft : ''}
+                      onStartEditingSession={onStartEditingSession}
+                      onCancelEditingSession={onCancelEditingSession}
+                      onSaveEditingSession={onSaveEditingSession}
+                      onProjectSelect={onProjectSelect}
+                      onSessionSelect={onSessionSelect}
+                      onArchiveSession={onArchiveSession}
+                      onDeleteSession={onDeleteSession}
+                      onForkSession={onForkSession}
+                      isSelecting={isSelecting}
+                      isChecked={checkedSessionIds.has(session.id)}
+                      onToggleSessionSelected={onToggleSessionSelected}
+                      treeRow={hasForks}
+                      t={t}
+                    />
+                  )}
                 </div>
               </div>
             ))}
