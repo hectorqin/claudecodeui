@@ -35,6 +35,8 @@ type AgentSessionRow = {
   provider: string;
   provider_session_id: string | null;
   project_path: string | null;
+  /** The session that started this one, set once at creation; see `parentSessionId` on POST /api/agent. */
+  parent_session_id: string | null;
 };
 
 type AgentRouterDependencies = {
@@ -52,7 +54,12 @@ type AgentRouterDependencies = {
   sessions: {
     getSessionById(sessionId: string): AgentSessionRow | null;
     getSessionByProviderSessionId(providerSessionId: string): AgentSessionRow | null;
-    createAppSession(provider: string, projectPath: string, initialMessage: string): { sessionId: string };
+    createAppSession(
+      provider: string,
+      projectPath: string,
+      initialMessage: string,
+      options?: { parentSessionId?: string | null },
+    ): { sessionId: string };
   };
   /** The live-run registry the chat socket uses; registering here is what puts an API run on the running-sessions list. */
   runs: Pick<typeof import('../websocket/index.js').chatRunRegistry, 'startRun' | 'completeRunIfCurrent' | 'isProcessing'>;
@@ -663,6 +670,15 @@ export function createAgentRouter(dependencies: AgentRouterDependencies): expres
    *                             A session already mid-run is refused (409); an unknown id, 404.
    *                             Omitted: a new session is created for the run.
    *
+   * @param {string} parentSessionId - (Optional) The session that starts this one, by app or
+   *                             provider-native id (resolved like `sessionId`), e.g. an
+   *                             orchestrator's lead session starting a worker. The UI nests the new
+   *                             session under it in the sidebar, even when it runs in another project
+   *                             or on another provider. Recorded only when a new session is created;
+   *                             it cannot be changed later. Unknown id: 400.
+   *                             When continuing (`sessionId` given) it may be omitted; if given it must
+   *                             name the parent the session was created with, otherwise 400.
+   *
    * @param {string} model - (Optional) Model identifier for providers.
    *                        Omitted: the provider's catalog DEFAULT from GET /api/providers/:provider/models,
    *                        which is the first custom model while "Use only my models" is on. Cursor
@@ -802,6 +818,8 @@ export function createAgentRouter(dependencies: AgentRouterDependencies): expres
    *   - provider must be 'claude', 'cursor', 'codex', or 'opencode'
    *   - createBranch/createPR requires githubUrl OR projectPath (not neither)
    *   - branchName must pass Git naming rules (if provided)
+   *   - parentSessionId must name an existing session, and on a continued session the one it was
+   *     created with (a session cannot be its own parent)
    *
    * Runtime Validations (500 Internal Server Error or specific error in response):
    *   - projectPath must exist (if used alone)
@@ -903,7 +921,7 @@ export function createAgentRouter(dependencies: AgentRouterDependencies): expres
    * probing with failing requests. Same API-key authentication as POST /api/agent.
    */
   router.get('/capabilities', validateExternalApiKey, (_req, res) => {
-    res.json({ permissionModes: AGENT_PERMISSION_MODES, unattended: true, sessionStatus: true });
+    res.json({ permissionModes: AGENT_PERMISSION_MODES, unattended: true, sessionStatus: true, childSessions: true });
   });
 
   /**
@@ -934,6 +952,12 @@ export function createAgentRouter(dependencies: AgentRouterDependencies): expres
       return res.status(400).json({ error: 'sessionId must be a string' });
     }
     const sessionId = typeof req.body.sessionId === 'string' && req.body.sessionId.trim() ? req.body.sessionId.trim() : null;
+    if (req.body.parentSessionId !== undefined && req.body.parentSessionId !== null && typeof req.body.parentSessionId !== 'string') {
+      return res.status(400).json({ error: 'parentSessionId must be a string' });
+    }
+    const parentSessionId = typeof req.body.parentSessionId === 'string' && req.body.parentSessionId.trim()
+      ? req.body.parentSessionId.trim()
+      : null;
     const requestedProvider = req.body.provider === undefined || req.body.provider === null ? null : req.body.provider;
     const effort = typeof req.body.effort === 'string' && req.body.effort.trim()
       ? req.body.effort.trim()
@@ -988,6 +1012,25 @@ export function createAgentRouter(dependencies: AgentRouterDependencies): expres
       // under external-projects. startRun below still has the last word.
       if (runRegistry.isProcessing(sessionRow.session_id)) {
         return res.status(409).json({ error: `Session "${sessionRow.session_id}" already has a run in progress` });
+      }
+    }
+    // The parent is resolved like `sessionId` and stored by its app id. It is
+    // fixed when the session is created: a continuation may repeat it, but a
+    // different one is refused rather than ignored, so a caller that mixed up
+    // its sessions finds out instead of seeing the tree silently disagree.
+    let parentRow = null;
+    if (parentSessionId) {
+      parentRow = sessionGateway.getSessionById(parentSessionId) ?? sessionGateway.getSessionByProviderSessionId(parentSessionId);
+      if (!parentRow) {
+        return res.status(400).json({ error: `parentSessionId "${parentSessionId}" was not found` });
+      }
+      if (sessionRow && parentRow.session_id === sessionRow.session_id) {
+        return res.status(400).json({ error: 'A session cannot be its own parent' });
+      }
+      if (sessionRow && parentRow.session_id !== (sessionRow.parent_session_id ?? null)) {
+        return res.status(400).json({
+          error: `Session "${sessionRow.session_id}" was created with ${sessionRow.parent_session_id ? `parent "${sessionRow.parent_session_id}"` : 'no parent'}; parentSessionId cannot change`,
+        });
       }
     }
     const provider = sessionRow?.provider ?? requestedProvider ?? 'claude';
@@ -1058,7 +1101,9 @@ export function createAgentRouter(dependencies: AgentRouterDependencies): expres
       // the provider-native id is mapped onto it when the runtime announces it.
       const appSessionId = sessionRow
         ? sessionRow.session_id
-        : sessionGateway.createAppSession(provider, finalProjectPath, message.trim()).sessionId;
+        : sessionGateway.createAppSession(provider, finalProjectPath, message.trim(), {
+          parentSessionId: parentRow?.session_id ?? null,
+        }).sessionId;
 
       // Registered before any header goes out, so a session already mid-run
       // is refused with a plain 409 rather than an empty stream. The HTTP

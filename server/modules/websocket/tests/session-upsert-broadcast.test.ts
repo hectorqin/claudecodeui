@@ -4,10 +4,12 @@ import { tmpdir } from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
 
-import { closeConnection, initializeDatabase, sessionsDb } from '@/modules/database/index.js';
+import { closeConnection, getConnection, initializeDatabase, sessionsDb } from '@/modules/database/index.js';
+import { sessionsService } from '@/modules/providers/index.js';
 import {
   broadcastSessionUpserted,
   broadcastSessionUpsertedBatch,
+  buildSessionUpsertedEvent,
 } from '@/modules/websocket/services/session-upsert-broadcast.service.js';
 import { connectedClients } from '@/modules/websocket/services/websocket-state.service.js';
 
@@ -155,5 +157,29 @@ test('a closed socket is skipped', async () => {
 
     assert.equal(open.frames.length, 1);
     assert.deepEqual(closing.frames, []);
+  });
+});
+
+test('session_upserted carries the attached parent for a child and the children for a parent', async () => {
+  await withIsolatedDatabase(async () => {
+    sessionsService.createAppSession('claude', '/workspace/acme-app', 'Use coagent to delegate');
+    const lead = sessionsDb.getSessionsByProjectPath('/workspace/acme-app')[0].session_id;
+    const coder = sessionsService.createAppSession('codex', '/workspace/acme-app-worktrees/coder', 'coder task', { parentSessionId: lead }).sessionId;
+    const reviewer = sessionsService.createAppSession('claude', '/workspace/acme-app', 'reviewer task', { parentSessionId: lead }).sessionId;
+    getConnection().prepare('UPDATE sessions SET created_at = ? WHERE session_id = ?').run('2026-11-21T00:00:00.000Z', coder);
+    getConnection().prepare('UPDATE sessions SET created_at = ? WHERE session_id = ?').run('2026-11-22T00:00:00.000Z', reviewer);
+
+    const childEvent = await buildSessionUpsertedEvent(coder);
+    assert.equal(childEvent?.session.parentSessionId, lead);
+    assert.deepEqual(childEvent?.session.childSessions, []);
+    assert.equal(childEvent?.provider, 'codex');
+    assert.equal(childEvent?.project?.path, '/workspace/acme-app-worktrees/coder', 'the child keeps naming the project it runs in');
+
+    const parentEvent = await buildSessionUpsertedEvent(lead);
+    assert.equal(parentEvent?.session.parentSessionId, null);
+    assert.deepEqual(parentEvent?.session.childSessions?.map((child) => child.id), [coder, reviewer]);
+
+    sessionsDb.updateSessionIsArchived(lead, true);
+    assert.equal((await buildSessionUpsertedEvent(coder))?.session.parentSessionId, null);
   });
 });
